@@ -71,7 +71,7 @@ def classify_industry(description: str) -> Optional[str]:
 
     def _try_model(model_name: str) -> Optional[str]:
         r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            f"{OPENROUTER_BASE_URL}/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER}",
                 "Content-Type": "application/json",
@@ -83,6 +83,7 @@ def classify_industry(description: str) -> Optional[str]:
                     {"role": "system", "content": prompt_system},
                     {"role": "user", "content": prompt_user},
                 ],
+                "chat_template_kwargs": {"enable_thinking": False},
             },
             timeout=10,
         )
@@ -163,6 +164,7 @@ def _intent_score(business: str, website: str, industry: Optional[str]) -> float
 # ---------------------------------------------------------------------
 
 OPENROUTER = os.getenv("OPENROUTER_KEY")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 PROMPT_SYSTEM = (
     "You are a B2B lead-generation assistant.\n"
@@ -194,16 +196,16 @@ PROMPT_SYSTEM_BATCH = (
     "Be discriminating - not all tech companies are equal. Differentiate based on specific sub-industries and business models."
 )
 
-PRIMARY_MODEL   = "openai/o3-mini:online"          # Best reasoning + web search, affordable
-FALLBACK_MODEL  = "deepseek/deepseek-r1:online"    # Competitive reasoning, reliable fallback
+PRIMARY_MODEL   = os.getenv("LEADSORCERER_PRIMARY_MODEL", "openai/o3-mini:online")          # Best reasoning + web search, affordable
+FALLBACK_MODEL  = os.getenv("LEADSORCERER_FALLBACK_MODEL", "deepseek/deepseek-r1:online")    # Competitive reasoning, reliable fallback
 MODEL_NAME      = PRIMARY_MODEL
 
 # Simple classification model (no reasoning needed)
-CLASSIFICATION_MODEL = "openai/gpt-4o-mini"  # Fast, cheap, no online needed
+CLASSIFICATION_MODEL = os.getenv("CLASSIFICATION_MODEL", "openai/gpt-4o-mini")
 
 def _call(model: str, prompt_user: str):
     return requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
+        f"{OPENROUTER_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER}",
                  "Content-Type": "application/json"},
         json={
@@ -212,12 +214,13 @@ def _call(model: str, prompt_user: str):
             "messages": [
                 {"role": "system", "content": PROMPT_SYSTEM},
                 {"role": "user",   "content": prompt_user}
-            ]},
+            ],
+            "chat_template_kwargs": {"enable_thinking": False}},
         timeout=15)
 
 def _call_batch(model: str, prompt_user: str):
     return requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
+        f"{OPENROUTER_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER}",
                  "Content-Type": "application/json"},
         json={
@@ -226,7 +229,8 @@ def _call_batch(model: str, prompt_user: str):
             "messages": [
                 {"role": "system", "content": PROMPT_SYSTEM_BATCH},
                 {"role": "user",   "content": prompt_user}
-            ]},
+            ],
+            "chat_template_kwargs": {"enable_thinking": False}},
         timeout=20)
 
 async def _score_batch(leads: list[dict], description: str) -> list[float]:
@@ -541,7 +545,7 @@ def classify_roles(description: str) -> list[str]:
 
     def _try_model(model_name: str) -> list[str]:
         r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            f"{OPENROUTER_BASE_URL}/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER}",
                 "Content-Type": "application/json",
@@ -553,6 +557,7 @@ def classify_roles(description: str) -> list[str]:
                     {"role": "system", "content": prompt_system},
                     {"role": "user", "content": prompt_user},
                 ],
+                "chat_template_kwargs": {"enable_thinking": False},
             },
             timeout=10,
         )

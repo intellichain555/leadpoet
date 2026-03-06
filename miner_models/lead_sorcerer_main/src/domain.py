@@ -59,43 +59,50 @@ DEFAULT_MAX_PAGES = 5
 DEFAULT_MODE = "thorough"
 
 # ============================================================================
-# Google Search Engine (GSE) Integration
+# Serper.dev Search Integration (replaces Google CSE)
 # ============================================================================
 
 
-class GSESearchClient:
-    """Client for Google Programmable Search Engine (GSE)."""
+class SerperSearchClient:
+    """Client for Serper.dev Google Search API."""
 
-    def __init__(self, api_key: str, cx: str, semaphore_pool: AsyncSemaphorePool):
+    def __init__(self, api_key: str, semaphore_pool: AsyncSemaphorePool):
         self.api_key = api_key
-        self.cx = cx
         self.semaphore_pool = semaphore_pool
-        self.base_url = "https://www.googleapis.com/customsearch/v1"
+        self.base_url = "https://google.serper.dev/search"
 
     async def search(self, query: str, page: int = 1) -> Dict[str, Any]:
         """
-        Perform Google search with pagination.
+        Perform Google search via Serper.dev with pagination.
 
         Args:
             query: Search query
             page: Page number (1-based)
 
         Returns:
-            Search results dictionary
+            Search results dictionary with "items" key for downstream compatibility
         """
         async with self.semaphore_pool:
-            params = {
-                "key": self.api_key,
-                "cx": self.cx,
+            headers = {
+                "X-API-KEY": self.api_key,
+                "Content-Type": "application/json",
+            }
+            payload = {
                 "q": query,
-                "start": (page - 1) * 10 + 1,  # GSE uses 1-based indexing
+                "page": page,
                 "num": 10,
             }
 
             async with httpx.AsyncClient(timeout=(3.0, 10.0)) as client:
-                response = await client.get(self.base_url, params=params)
+                response = await client.post(
+                    self.base_url, json=payload, headers=headers
+                )
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+                # Remap Serper response to GSE-compatible format.
+                # Serper returns {"organic": [{"title", "link", "snippet", ...}]}
+                # Downstream code expects {"items": [{"title", "link", "snippet"}]}
+                return {"items": data.get("organic", [])}
 
 
 # ============================================================================
@@ -104,15 +111,16 @@ class GSESearchClient:
 
 
 class LLMScorer:
-    """LLM-based domain scoring using OpenRouter."""
+    """LLM-based domain scoring using a configurable OpenAI-compatible endpoint."""
 
     def __init__(self, api_key: str, semaphore_pool: AsyncSemaphorePool):
-        self.client = AsyncOpenAI(
-            api_key=api_key, base_url="https://openrouter.ai/api/v1"
-        )
+        # Allow overriding the base URL and model names via env so miners
+        # can use providers like Chutes.ai instead of OpenRouter.
+        base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.semaphore_pool = semaphore_pool
-        self.primary_model = "gpt-4o-mini"
-        self.fallback_model = "gpt-3.5-turbo"
+        self.primary_model = os.getenv("LEADSORCERER_PRIMARY_MODEL", "gpt-4o-mini")
+        self.fallback_model = os.getenv("LEADSORCERER_FALLBACK_MODEL", "gpt-3.5-turbo")
 
     def _build_scoring_prompt(
         self, title: str, snippet: str, query: str, icp_text: str
@@ -182,6 +190,7 @@ Example flags: geo_mismatch, size_mismatch, industry_mismatch, stage_mismatch, t
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=500,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 model_used = self.primary_model
             except Exception:
@@ -191,6 +200,7 @@ Example flags: geo_mismatch, size_mismatch, industry_mismatch, stage_mismatch, t
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=500,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 model_used = self.fallback_model
 
@@ -396,7 +406,7 @@ class DomainTool:
 
         # Load costs configuration
         self.costs_config = load_costs_config()
-        validate_provider_config(["gse", "openrouter"], self.costs_config)
+        validate_provider_config(["serper", "openrouter"], self.costs_config)
 
         # Initialize components
         self.permit_manager = PermitManager(
@@ -406,9 +416,8 @@ class DomainTool:
         )
         self.semaphore_pool = AsyncSemaphorePool(self.permit_manager)
 
-        self.gse_client = GSESearchClient(
-            api_key=os.environ["GSE_API_KEY"],
-            cx=os.environ["GSE_CX"],
+        self.search_client = SerperSearchClient(
+            api_key=os.environ["SERPER_API_KEY"],
             semaphore_pool=self.semaphore_pool,
         )
 
@@ -647,7 +656,7 @@ class DomainTool:
 
             # Fetch fresh
             try:
-                results = await self.gse_client.search(query, page)
+                results = await self.search_client.search(query, page)
                 cache_misses += 1
                 # Cache
                 self.search_cache.cache_results(query, page, results)
@@ -805,7 +814,7 @@ class DomainTool:
                 )
 
                 # Calculate costs
-                gse_cost = self.costs_config["gse"]
+                gse_cost = self.costs_config["serper"]
                 openrouter_cost = self.costs_config["openrouter"]
 
                 # Estimate token usage (rough approximation)
@@ -848,7 +857,7 @@ class DomainTool:
                 )
 
                 # Set minimal cost
-                record["cost"]["domain_usd"] = round4(self.costs_config["gse"])
+                record["cost"]["domain_usd"] = round4(self.costs_config["serper"])
                 recompute_total_cost(record)
 
             # Store in domain map

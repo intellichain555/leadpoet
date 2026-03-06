@@ -5,10 +5,14 @@ openrouter:
   unit: '1k_tokens'
   usd_per_unit: 0.0020
 
-gse:
+serper:
   unit: 'request'
   usd_per_unit: 0.0005
 
-firecrawl:
-  unit: 'extract'
+crawl4ai:
+  unit: 'page_fetch'
+  usd_per_unit: 0.0000
+
+llm_extract:
+  unit: 'extraction'
   usd_per_unit: 0.0010

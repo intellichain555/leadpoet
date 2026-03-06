@@ -17,6 +17,7 @@ import html
 from datetime import datetime, timezone
 import json
 from Leadpoet.base.utils.pool import get_leads_from_pool
+from neurons.lead_tracker import LeadTracker
 
 from miner_models.intent_model import (
     rank_leads,
@@ -61,8 +62,11 @@ class Miner(BaseMinerNeuron):
         super().__init__(config=config)
         self.use_open_source_lead_model = config.get(
             "use_open_source_lead_model", True) if config else True
+        self.icp_mode = getattr(config, "icp_mode", None)
         bt.logging.info(
             f"Using open-source lead model: {self.use_open_source_lead_model}")
+        if self.icp_mode:
+            bt.logging.info(f"ICP mode: {self.icp_mode}")
         self.app = web.Application()
         self.app.add_routes(
             [web.post('/lead_request', self.handle_lead_request)])
@@ -73,7 +77,9 @@ class Miner(BaseMinerNeuron):
         self.cloud_task: Optional[asyncio.Task] = None
         self._bg_interval: int = 60
         self._miner_hotkey: Optional[str] = None
-        
+        self.enable_axon = False  # SN71 is gateway-push only; no miner uses axon
+        self.lead_tracker = LeadTracker()
+
         bt.logging.info(f"✅ Miner initialized (using trustless gateway - no JWT tokens)")
 
     def pause_sourcing(self):
@@ -150,15 +156,17 @@ class Miner(BaseMinerNeuron):
             # Determine source type FIRST (needed for validation)
             source_type = determine_source_type(source_url, lead)
             
-            # Validate source URL against regulatory requirements
-            try:
-                is_valid, reason = await validate_source_url(source_url, source_type)
-                if not is_valid:
-                    bt.logging.warning(f"Invalid source URL: {source_url} - {reason}")
+            # Validate source URL against regulatory requirements.
+            # Skip if csv_refine already validated it (avoids redundant request).
+            if not lead.get("_source_url_validated"):
+                try:
+                    is_valid, reason = await validate_source_url(source_url, source_type)
+                    if not is_valid:
+                        bt.logging.warning(f"Invalid source URL: {source_url} - {reason}")
+                        continue
+                except Exception as e:
+                    bt.logging.error(f"Error validating source URL {source_url}: {e}")
                     continue
-            except Exception as e:
-                bt.logging.error(f"Error validating source URL {source_url}: {e}")
-                continue
             
             # Enrich lead with provenance metadata
             lead["source_url"] = source_url
@@ -186,7 +194,16 @@ class Miner(BaseMinerNeuron):
                     if not self.sourcing_mode:
                         continue
                     print("\n🔄 Sourcing new leads...")
-                new_leads = await get_leads(1, industry=None, region=None)
+                if self.icp_mode == "aiml_crunchbase":
+                    from miner_models.lead_sorcerer_main.main_leads import get_leads_crunchbase
+                    new_leads = await get_leads_crunchbase(num_leads=1, batch_size=5)
+                elif self.icp_mode == "crunchbase_us":
+                    from miner_models.lead_sorcerer_main.main_leads import get_leads_csv
+                    new_leads = await get_leads_csv(batch_size=5)
+                else:
+                    # Default mode: refine pre-extracted leads from data/csv_leads.json
+                    from miner_models.lead_sorcerer_main.main_leads import get_leads_csv_refine
+                    new_leads = await get_leads_csv_refine(json_path="data/rocketreach_leads.json", batch_size=3)
                 
                 # Process leads through source provenance validation (protocol level)
                 validated_leads = await self.process_generated_leads(new_leads)
@@ -210,68 +227,80 @@ class Miner(BaseMinerNeuron):
                         gateway_upload_lead,
                         gateway_verify_submission
                     )
-                    
+
                     submitted_count = 0
                     verified_count = 0
                     duplicate_count = 0
-                    
+
                     for lead in sanitized:
                         business_name = lead.get('business', 'Unknown')
                         email = lead.get('email', '')
                         linkedin_url = lead.get('linkedin', '')
                         company_linkedin_url = lead.get('company_linkedin', '')
-                        
+
                         # Step 0: Check for duplicates BEFORE calling presign (saves time & rate limit)
                         # Check both email AND linkedin combo (person+company)
-                        
+
                         # Check email duplicate (approved or processing = skip, rejected = allow)
                         if check_email_duplicate(email):
                             print(f"⏭️  Skipping duplicate email: {business_name} ({email})")
                             duplicate_count += 1
+                            self.lead_tracker.log_submission(lead, "duplicate_email")
                             continue
-                        
+
                         # Check linkedin combo duplicate (same logic: approved/processing = skip, rejected = allow)
                         if linkedin_url and company_linkedin_url:
                             if check_linkedin_combo_duplicate(linkedin_url, company_linkedin_url):
                                 print(f"⏭️  Skipping duplicate person+company: {business_name}")
                                 print(f"      LinkedIn: {linkedin_url[:50]}...")
                                 print(f"      Company: {company_linkedin_url[:50]}...")
-                            duplicate_count += 1
-                            continue
-                        
+                                duplicate_count += 1
+                                self.lead_tracker.log_submission(lead, "duplicate_linkedin")
+                                continue
+
                         # Step 1: Get presigned URLs (gateway logs SUBMISSION_REQUEST with committed hash)
                         presign_result = gateway_get_presigned_url(self.wallet, lead)
                         if not presign_result:
                             print(f"⚠️  Failed to get presigned URL for {business_name}")
+                            self.lead_tracker.log_submission(lead, "presign_failed")
                             continue
-                        
+
                         # Step 2: Upload to S3 (gateway will mirror to MinIO automatically)
                         s3_uploaded = gateway_upload_lead(presign_result['s3_url'], lead)
                         if not s3_uploaded:
                             print(f"⚠️  Failed to upload to S3: {business_name}")
+                            self.lead_tracker.log_submission(
+                                lead, "s3_upload_failed",
+                                lead_id=presign_result.get('lead_id'),
+                            )
                             continue
-                        
+
                         print(f"✅ Lead uploaded to S3 (gateway will mirror to MinIO)")
                         submitted_count += 1
-                        
+
                         # Step 4: Trigger gateway verification (BRD Section 4.1, Steps 5-6)
-                        # Gateway will:
-                        # - Fetch uploaded blobs from S3/MinIO
-                        # - Verify hashes match committed lead_blob_hash
-                        # - Log STORAGE_PROOF events (one per mirror)
-                        # - Store lead in leads_private table
-                        # - Log SUBMISSION event
                         verification_result = gateway_verify_submission(
                             self.wallet,
                             presign_result['lead_id']
                         )
-                        
+
                         if verification_result:
                             verified_count += 1
+                            status = "verified"
                             print(f"✅ Verified: {business_name} (backends: {verification_result['storage_backends']})")
                         else:
+                            status = "gateway_rejected"
                             print(f"⚠️  Verification failed: {business_name}")
-                    
+
+                        self.lead_tracker.log_submission(
+                            lead, status,
+                            lead_id=presign_result.get('lead_id'),
+                            verification_result=verification_result,
+                        )
+
+                        # Anti-spam cooldown between submissions
+                        await asyncio.sleep(20)
+
                     if verified_count > 0:
                         print(
                             f"✅ Successfully submitted and verified {verified_count}/{len(sanitized)} leads "
@@ -405,6 +434,26 @@ class Miner(BaseMinerNeuron):
             except Exception as e:
                 print(f"❌ Cloud-curation loop error: {e}")
                 await asyncio.sleep(10)
+
+    async def rejection_feedback_loop(self, interval: int = 300):
+        """Fetch rejection feedback every `interval` seconds and update local DB."""
+        print(f"📋 Starting rejection feedback loop (interval: {interval}s)")
+        from Leadpoet.utils.cloud_db import get_rejection_feedback
+        await asyncio.sleep(60)  # let the miner finish startup
+        while True:
+            try:
+                feedback_records = get_rejection_feedback(self.wallet, limit=50)
+                updated = 0
+                for record in feedback_records:
+                    prospect_id = record.get("prospect_id", "")
+                    if prospect_id:
+                        if self.lead_tracker.update_rejection_feedback(prospect_id, record):
+                            updated += 1
+                if updated > 0:
+                    print(f"📋 Updated {updated} lead(s) with rejection feedback")
+            except Exception as e:
+                print(f"⚠️  Rejection feedback fetch error: {e}")
+            await asyncio.sleep(interval)
 
     async def broadcast_curation_loop(self, miner_hotkey: str):
         """
@@ -1017,18 +1066,34 @@ class Miner(BaseMinerNeuron):
     def run(self):
         """
         Start the miner and run until interrupted.
-        
-        The miner uses wallet signature-based authentication via the trustless gateway.
-        No JWT tokens or server-issued credentials are used (BRD Section 3.5).
+
+        SN71 is gateway-push only — miners submit leads via HTTP.
+        Axon is available but disabled by default (self.enable_axon).
+        Set self.enable_axon = True if the subnet ever requires it.
         """
-        bt.logging.info("Starting miner...")
-        
+        self.sync()
+        if self.uid is None:
+            bt.logging.error("Cannot run miner: UID not set. Please register the wallet on the network.")
+            return
+
+        if self.enable_axon:
+            bt.logging.info("Starting axon serve + start...")
+            self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+            self.axon.start()
+            bt.logging.info(
+                f"Axon listening on 0.0.0.0:{self.config.axon.port} "
+                f"(external: {getattr(self.config.axon, 'external_ip', '?')}:"
+                f"{getattr(self.config.axon, 'external_port', '?')})"
+            )
+        else:
+            bt.logging.info("Axon disabled (gateway-push mode, no miners use axon on SN71)")
+
         try:
             while True:
-                # Sync metagraph and check miner status
                 time.sleep(12)
-                
         except KeyboardInterrupt:
+            if self.enable_axon:
+                self.axon.stop()
             bt.logging.success("Miner killed by keyboard interrupt.")
             exit()
         except Exception as e:
@@ -1821,7 +1886,9 @@ def sanitize_prospect(prospect, miner_hotkey=None):
     email = prospect.get("email", prospect.get("Owner(s) Email", ""))
     full_name = prospect.get("full_name", prospect.get("Owner Full name", ""))
     
+    # Only send gateway-required fields
     sanitized = {
+        # 16 required fields
         "business":
         strip_html(prospect.get("business", prospect.get("Business", ""))),
         "full_name":
@@ -1831,46 +1898,49 @@ def sanitize_prospect(prospect, miner_hotkey=None):
         "last":
         strip_html(prospect.get("last", prospect.get("Last", ""))),
         "email":
-        strip_html(email),  # Use consistent field name
-        "linkedin":
-        strip_html(prospect.get("linkedin", prospect.get("LinkedIn", ""))),
+        strip_html(email),
+        "role":
+        strip_html(prospect.get("role", prospect.get("Title", ""))),
         "website":
         strip_html(prospect.get("website", prospect.get("Website", ""))),
         "industry":
         strip_html(prospect.get("industry", prospect.get("Industry", ""))),
-        "role":
-        strip_html(prospect.get("role", prospect.get("Title", ""))),
         "sub_industry":
         strip_html(
             prospect.get("sub_industry", prospect.get("Sub Industry", ""))),
         "country":
         strip_html(prospect.get("country", prospect.get("Country", ""))),
-        "state":
-        strip_html(prospect.get("state", prospect.get("State", ""))),
         "city":
         strip_html(prospect.get("city", prospect.get("City", ""))),
-        "region":
-        strip_html(prospect.get("region", prospect.get("Region", ""))),
-        "description":
-        strip_html(prospect.get("description", "")),
+        "linkedin":
+        strip_html(prospect.get("linkedin", prospect.get("LinkedIn", ""))),
         "company_linkedin":
         strip_html(prospect.get("company_linkedin", prospect.get("Company LinkedIn", ""))),
-        "phone_numbers":
-        prospect.get("phone_numbers", []),
-        "founded_year":
-        prospect.get("founded_year", prospect.get("Founded Year", "")),
-        "ownership_type":
-        strip_html(prospect.get("ownership_type", prospect.get("Ownership Type", ""))),
-        "company_type":
-        strip_html(prospect.get("company_type", prospect.get("Company Type", ""))),
-        "number_of_locations":
-        prospect.get("number_of_locations", prospect.get("Number of Locations", "")),
+        "source_url":
+        prospect.get("source_url", ""),
+        "source_type":
+        prospect.get("source_type", ""),
+        "license_doc_hash":
+        prospect.get("license_doc_hash", ""),
+        "license_doc_url":
+        prospect.get("license_doc_url", ""),
+        "description":
+        strip_html(prospect.get("description", "")),
         "employee_count":
         strip_html(prospect.get("employee_count", prospect.get("Employee Count", ""))),
-        "socials":
-        prospect.get("socials", {}),
+        # HQ location (validated separately by gateway)
+        "hq_country":
+        strip_html(prospect.get("hq_country", prospect.get("country", prospect.get("Country", "")))),
+        "hq_state":
+        strip_html(prospect.get("hq_state", prospect.get("state", prospect.get("State", "")))),
+        "hq_city":
+        strip_html(prospect.get("hq_city", prospect.get("city", prospect.get("City", "")))),
+        # State (required for US)
+        "state":
+        strip_html(prospect.get("state", prospect.get("State", ""))),
+        # Miner identity
         "source":
-        miner_hotkey  # Add source field
+        miner_hotkey,
     }
 
     if not valid_url(sanitized["linkedin"]):
@@ -1891,31 +1961,17 @@ def sanitize_prospect(prospect, miner_hotkey=None):
             terms_hash = "NOT_ATTESTED"
             wallet_ss58 = miner_hotkey or "UNKNOWN"
     else:
-        # Should never happen if TASK 1.1 is working, but handle gracefully
         bt.logging.warning("No attestation file found - miner should have accepted terms at startup")
         terms_hash = "NOT_ATTESTED"
         wallet_ss58 = miner_hotkey or "UNKNOWN"
-    
-    # Add regulatory attestation fields (per-submission metadata)
+
     sanitized.update({
-        # Miner identity & attestation
         "wallet_ss58": wallet_ss58,
         "submission_timestamp": datetime.now(timezone.utc).isoformat(),
         "terms_version_hash": terms_hash,
-        
-        # Boolean attestations (implicit from terms acceptance)
         "lawful_collection": True,
         "no_restricted_sources": True,
         "license_granted": True,
-        
-        # Source provenance (Task 1.3 - may be added later)
-        # These fields will be populated by process_generated_leads() in Task 1.3
-        "source_url": prospect.get("source_url", ""),
-        "source_type": prospect.get("source_type", ""),
-        
-        # Optional: Licensed resale fields (Task 1.4)
-        "license_doc_hash": prospect.get("license_doc_hash", ""),
-        "license_doc_url": prospect.get("license_doc_url", ""),
     })
 
     return sanitized
@@ -1980,6 +2036,9 @@ async def run_miner(miner, miner_hotkey=None, interval=60, queue_maxsize=1000):
     miner.sourcing_task = asyncio.create_task(miner.sourcing_loop(
         interval, miner_hotkey),
                                               name="sourcing_loop")
+    miner.feedback_task = asyncio.create_task(
+        miner.rejection_feedback_loop(300),
+        name="rejection_feedback_loop")
     # Disabled old curation loops (rely on deleted tables from JWT system)
     # miner.cloud_task = asyncio.create_task(
     #     miner.cloud_curation_loop(miner_hotkey), name="cloud_curation_loop")
@@ -1987,8 +2046,10 @@ async def run_miner(miner, miner_hotkey=None, interval=60, queue_maxsize=1000):
     #     miner.broadcast_curation_loop(miner_hotkey),
     #     name="broadcast_curation_loop")
 
-    print("✅ Started 1 background task:")
+    mode_label = miner.icp_mode or "csv_refine"
+    print(f"✅ Started 2 background tasks (ICP mode: {mode_label}):")
     print("   1. sourcing_loop - Continuous lead sourcing via trustless gateway")
+    print("   2. rejection_feedback_loop - Fetch rejection reasons every 5 min")
 
     # Keep alive
     while True:
@@ -2044,6 +2105,7 @@ def main():
     config.neuron = bt.Config()
     config.neuron.epoch_length = args.neuron_epoch_length or 1000
     config.use_open_source_lead_model = args.use_open_source_lead_model
+    config.icp_mode = getattr(args, "icp_mode", None)
 
     # AXON NETWORKING
     # Bind locally on 0.0.0.0 but advertise the user-supplied external
@@ -2219,14 +2281,8 @@ def main():
 
     def run_miner_safe():
         try:
-            print(" Starting Bittensor miner axon...")
-            print("   Syncing metagraph...")
-            miner.sync()
-            print(f"   Current block: {miner.block}")
-            print(f"   Metagraph has {len(miner.metagraph.axons)} axons")
-            print(f"   My axon should be at index {miner.uid}")
-
-            miner.run()
+            print("🚀 Starting Bittensor miner axon...")
+            miner.run()  # handles sync + axon.serve + axon.start internally
         except Exception as e:
             print(f"❌ Error in miner.run(): {e}")
             import traceback

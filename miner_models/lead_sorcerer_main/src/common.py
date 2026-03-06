@@ -355,15 +355,15 @@ def resolve_data_dir(payload: Dict[str, Any]) -> str:
     """
     # Check payload.config.data_dir first
     if payload.get("config", {}).get("data_dir"):
-        return payload["config"]["data_dir"]
+        return os.path.abspath(payload["config"]["data_dir"])
 
     # Check environment variable
     env_data_dir = os.environ.get("LEADPOET_DATA_DIR")
     if env_data_dir:
-        return env_data_dir
+        return os.path.abspath(env_data_dir)
 
-    # Default to ./data
-    return "./data"
+    # Default to ./data (absolute so temp-dir changes don't break paths)
+    return os.path.abspath("./data")
 
 
 def compute_next_revisit(

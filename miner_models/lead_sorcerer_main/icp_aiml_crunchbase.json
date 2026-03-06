@@ -1,0 +1,142 @@
+{
+  "name": "AI ML Crunchbase Startups",
+  "icp_text": "AI and machine learning startup companies. Target technical and executive decision-makers such as CEO, CTO, VP of Engineering, VP of AI, Chief AI Officer, Head of ML, Director of Engineering, Co-Founder, and technical leads at these companies for business development, partnership, and sales opportunities.",
+  "queries": [
+    "artificial intelligence startup company contact",
+    "machine learning company team page"
+  ],
+  "required_fields": {
+    "company": ["name", "industry", "sub_industry"],
+    "contact": ["email", "job_title", "full_name"]
+  },
+  "optional_fields": {
+    "company": ["hq_location", "revenue_range", "employee_count", "specialties", "founded_year", "company_type", "number_of_locations", "ownership_type"],
+    "contact": ["phone", "linkedin_url", "decision_maker", "department", "seniority"]
+  },
+  "threshold": 0.2,
+  "filtering_strict": false,
+  "mode": "fast",
+  "refresh_policy": {
+    "revisit_after_days": 90,
+    "failure_revisit_days": 7,
+    "domain_serp_ttl_hours": 48,
+    "crawl_ttl_days": 14,
+    "enrich_ttl_days": 30
+  },
+  "concurrency": {
+    "max_concurrent_requests": 3
+  },
+  "search": {
+    "max_pages": 1,
+    "max_results_per_query": 30
+  },
+  "testing": {
+    "process_rejected": true,
+    "process_low_crawl": true,
+    "force_contact_discovery": true
+  },
+  "caps": {
+    "company_usd": 0.02,
+    "contact_usd": 0.03,
+    "run_usd_max": 5.0,
+    "max_domains_per_run": 10,
+    "max_crawl_per_run": 10,
+    "max_enrich_per_run": 10
+  },
+  "role_priority": {
+    "ceo": 1,
+    "cto": 1,
+    "co-founder": 1,
+    "founder": 1,
+    "chief ai officer": 1,
+    "chief data officer": 1,
+    "chief scientist": 2,
+    "president": 2,
+    "vp of engineering": 2,
+    "vp of ai": 2,
+    "vp of machine learning": 2,
+    "vp of product": 2,
+    "vp of technology": 2,
+    "vp of research": 2,
+    "head of engineering": 2,
+    "head of ml": 2,
+    "head of machine learning": 2,
+    "head of ai": 2,
+    "director of engineering": 3,
+    "director of ai": 3,
+    "engineering director": 3,
+    "principal engineer": 3,
+    "staff engineer": 4,
+    "coo": 3,
+    "cmo": 3,
+    "default": 99
+  },
+  "exports": {
+    "enabled": true
+  },
+  "default_country": "US",
+  "exclusion_criteria": {
+    "ownership_types": [],
+    "max_locations": 10000,
+    "excluded_keywords": []
+  },
+  "targeting": {
+    "location_types": ["headquarters", "single_location"],
+    "company_sizes": ["small", "mid-market"],
+    "ownership_models": ["private"],
+    "geographic_focus": ["North America", "United States", "Europe"]
+  },
+  "intent_config": {
+    "purpose": "ai_ml_business_development",
+    "target_action": "partnership_sales",
+    "intent_signals": {
+      "high_intent": [
+        "artificial intelligence",
+        "machine learning",
+        "deep learning",
+        "AI platform",
+        "ML infrastructure",
+        "generative AI",
+        "large language model",
+        "computer vision",
+        "natural language processing",
+        "neural network",
+        "autonomous systems",
+        "AI SaaS",
+        "MLOps",
+        "foundation model"
+      ],
+      "medium_intent": [
+        "data science",
+        "analytics",
+        "automation",
+        "cloud computing",
+        "software engineering",
+        "DevOps",
+        "enterprise software",
+        "technology",
+        "robotics"
+      ],
+      "low_intent": [
+        "not hiring",
+        "stealth mode",
+        "pre-revenue"
+      ]
+    },
+    "intent_sources": [
+      "about_pages",
+      "team_pages",
+      "contact_pages",
+      "careers_pages"
+    ],
+    "scoring_rules": {
+      "high_intent_weight": 0.8,
+      "medium_intent_weight": 0.4,
+      "low_intent_weight": -0.1,
+      "base_score": 0.5,
+      "location_bonus": 0.1,
+      "size_bonus": 0.1,
+      "leadership_bonus": 0.15
+    }
+  }
+}

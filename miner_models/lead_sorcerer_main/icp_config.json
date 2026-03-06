@@ -1,12 +1,18 @@
 {
-  "name": "Startup Advisory Services - Test ICP",
-  "icp_text": "Small startup advisory and consulting firms with founder and advisor contact information for business development and partnership opportunities.",
+  "name": "Startup Advisory Services",
+  "icp_text": "Small to mid-size startup advisory, consulting, and coaching firms that help early-stage founders with strategy, fundraising, go-to-market, and growth. Target decision-makers such as founders, managing partners, and senior advisors at these firms for business development and partnership opportunities.",
   "queries": [
-    "startup advisory services founder contact",
-    "business consulting firm advisor email"
+    "startup advisory firm founder CEO contact",
+    "startup consulting company managing partner",
+    "venture advisory services team about us",
+    "early stage startup coach advisor firm",
+    "fractional CTO CFO advisory startup",
+    "startup accelerator advisory services contact",
+    "business growth consulting small firm founder",
+    "entrepreneurship coaching consulting firm about",
+    "startup strategy consulting boutique firm",
+    "founder advisory board services company"
   ],
-  "specific_urls": ["https://www.founderadvisors.tech/"],
-  "default_contact_linkedin": "https://www.linkedin.com/in/rogertoennis/",
   "required_fields": {
     "company": ["name", "industry", "sub_industry"],
     "contact": ["email", "job_title", "full_name"]
@@ -29,8 +35,8 @@
     "max_concurrent_requests": 3
   },
   "search": {
-    "max_pages": 5,
-    "max_results_per_query": 50
+    "max_pages": 3,
+    "max_results_per_query": 30
   },
   "testing": {
     "process_rejected": true,

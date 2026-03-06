@@ -23,6 +23,11 @@ class BaseMinerNeuron(BaseNeuron):
         parser.add_argument("--logging_trace", action="store_true", help="Enable trace-level logging", default=False)
         parser.add_argument("--axon_ip", type=str, help="Public IP address that validators should use to reach this miner", default=None)
         parser.add_argument("--axon_port", type=int, help="Public port that validators should use to reach this miner", default=None)
+        parser.add_argument("--icp_mode", type=str, default=None,
+                            help="ICP pipeline mode. Default (no flag): 'csv_refine' — "
+                                 "refines leads from data/csv_leads.json (run scripts/extract_csv_leads.py first). "
+                                 "'crunchbase_us' — crawls companies from docs/crunchbase_test.csv. "
+                                 "'aiml_crunchbase' — curates AI/ML companies from Crunchbase API.")
 
     def __init__(self, config=None):
         super().__init__(config=config)

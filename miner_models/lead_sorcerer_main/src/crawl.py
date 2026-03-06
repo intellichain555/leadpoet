@@ -16,6 +16,7 @@ Authoritative specifications: docs/brd.md §273-320
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -67,9 +68,25 @@ FIRECRAWL_EXTRACT_SCHEMA = {
                 },
                 "industry": {"type": "string", "description": "Industry or sector"},
                 "sub_industry": {"type": "string", "description": "Specific sub-industry or niche within the broader industry"},
+                "hq_city": {
+                    "type": "string",
+                    "description": "Headquarters city name",
+                },
+                "hq_country": {
+                    "type": "string",
+                    "description": "Headquarters country name",
+                },
+                "hq_state": {
+                    "type": "string",
+                    "description": "Headquarters state/province/region (e.g. California, Ontario)",
+                },
                 "hq_location": {
                     "type": "string",
-                    "description": "Headquarters location (city, state, country)",
+                    "description": "Full headquarters location (city, state, country)",
+                },
+                "linkedin_url": {
+                    "type": "string",
+                    "description": "Company LinkedIn URL (e.g. https://linkedin.com/company/...)",
                 },
                 "number_of_locations": {
                     "type": "integer",
@@ -133,6 +150,7 @@ FIRECRAWL_EXTRACT_SCHEMA = {
                     "role": {"type": "string", "description": "Job title/role"},
                     "email": {"type": "string", "description": "Email address"},
                     "phone": {"type": "string", "description": "Phone number"},
+                    "linkedin_url": {"type": "string", "description": "Personal LinkedIn profile URL"},
                     "decision_maker": {
                         "type": "boolean",
                         "description": "Whether this person is a decision maker",
@@ -176,7 +194,8 @@ FIRECRAWL_EXTRACT_PROMPT = (
     "- Key executives and decision makers\n"
     "- Names, roles, and contact information\n"
     "- Focus on owners, CEOs, founders, managers\n"
-    "- Limit to 10 most important people\n\n"
+    "- Limit to 10 most important people\n"
+    "- ONLY include linkedin_url if an actual LinkedIn URL appears on the page (e.g. as a link or href). Do NOT guess or fabricate LinkedIn URLs from names.\n\n"
     "IMPORTANT: Extract only what you can clearly see on the website. If information is not available, leave it as null."
 )
 
@@ -190,32 +209,31 @@ class CrawlTool:
     """Crawl tool for extracting company and contact information from websites."""
 
     def __init__(self, data_dir: Optional[str] = None):
-        self.data_dir = data_dir or "./data"
+        self.data_dir = os.path.abspath(data_dir or "./data")
         # Setup logging (child tools inherit shared run log via env)
         self.logger = setup_logging(TOOL_NAME, data_dir=self.data_dir)
         self.schema_version = load_schema_checksum()
         self.costs_config = load_costs_config()
 
-        # Validate required providers
-        required_providers = ["firecrawl"]
-        for provider in required_providers:
-            if provider not in self.costs_config:
-                raise KeyError(
-                    f"Missing required provider in costs configuration: {provider}"
-                )
+        # Initialize LLM client for structured extraction (Chutes.ai via OpenAI SDK)
+        from openai import AsyncOpenAI
 
-        # Initialize Firecrawl client
-        self.firecrawl_key = os.environ.get("FIRECRAWL_KEY")
-        if not self.firecrawl_key:
-            raise ValueError("FIRECRAWL_KEY environment variable is required")
+        llm_api_key = os.environ.get("OPENROUTER_KEY")
+        if not llm_api_key:
+            raise ValueError(
+                "OPENROUTER_KEY environment variable is required for LLM extraction"
+            )
 
-        from firecrawl import Firecrawl
+        llm_base_url = os.getenv("OPENROUTER_BASE_URL", "https://llm.chutes.ai/v1")
+        self.llm_client = AsyncOpenAI(api_key=llm_api_key, base_url=llm_base_url)
+        self.primary_model = os.getenv("LEADSORCERER_PRIMARY_MODEL", "Qwen/Qwen3-14B")
+        self.fallback_model = os.getenv(
+            "LEADSORCERER_FALLBACK_MODEL",
+            "chutesai/Mistral-Small-3.2-24B-Instruct-2506",
+        )
 
-        self.firecrawl_client = Firecrawl(api_key=self.firecrawl_key)
         # Global permit manager for concurrency control
-        self.permit_manager = PermitManager(
-            max_permits=3
-        )  # Default, will be overridden
+        self.permit_manager = PermitManager(max_permits=3)
         self.async_semaphore_pool = AsyncSemaphorePool(self.permit_manager)
 
     def generate_dynamic_intent_prompt(self, icp_config):
@@ -1060,7 +1078,7 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
             record["domain"] = normalized_domain
 
         # Check artifact cache using URL-specific cache key
-        data_dir = resolve_data_dir({"config": {"data_dir": None}})
+        data_dir = self.data_dir
         cache_key = self._generate_cache_key(normalized_domain, icp_config)
         artifact_path = f"{data_dir}/crawl_artifacts/{cache_key}.json"
 
@@ -1108,7 +1126,7 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
         # Extract data if not cached
         if not cache_hit:
             try:
-                extracted_data = await self._extract_with_firecrawl(
+                extracted_data = await self._extract_with_crawl4ai(
                     normalized_domain, icp_config
                 )
 
@@ -1229,8 +1247,8 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
                 # Truncate evidence arrays
                 truncate_evidence_arrays(record)
 
-                # COST OPTIMIZED: Single scrape operation instead of scrape+extract
-                cost = 0.0 if cache_hit else self.costs_config["firecrawl"]
+                # Crawl4AI is free; LLM extraction cost tracked separately
+                cost = 0.0 if cache_hit else self.costs_config.get("llm_extract", 0.001)
                 if "cost" not in record:
                     record["cost"] = {
                         "domain_usd": 0.0,
@@ -1289,11 +1307,288 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
             "error": None,
         }
 
-    async def _extract_with_firecrawl(
+    async def _crawl_pages_to_markdown(
+        self, urls: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch URLs using Crawl4AI and return markdown content for each.
+
+        Args:
+            urls: List of URLs to fetch
+
+        Returns:
+            List of dicts with 'url', 'markdown', 'success' keys
+        """
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+        browser_config = BrowserConfig(
+            headless=True,
+            extra_args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        crawler_config = CrawlerRunConfig(
+            wait_until="domcontentloaded",
+            page_timeout=30000,
+            word_count_threshold=10,
+        )
+
+        results = []
+        try:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                for url in urls:
+                    try:
+                        result = await crawler.arun(url=url, config=crawler_config)
+                        if result.success and result.markdown:
+                            self.logger.info(
+                                f"Crawl4AI fetched {url}: {len(result.markdown)} chars"
+                            )
+                            results.append(
+                                {"url": url, "markdown": result.markdown, "success": True}
+                            )
+                        else:
+                            err = getattr(result, "error_message", "unknown error")
+                            self.logger.warning(f"Crawl4AI failed for {url}: {err}")
+                            results.append({"url": url, "markdown": "", "success": False})
+                    except Exception as exc:
+                        self.logger.warning(f"Crawl4AI exception for {url}: {exc}")
+                        results.append({"url": url, "markdown": "", "success": False})
+        except Exception as exc:
+            self.logger.error(f"Crawl4AI browser error: {exc}")
+            # Return failures for all remaining URLs
+            fetched_urls = {r["url"] for r in results}
+            for url in urls:
+                if url not in fetched_urls:
+                    results.append({"url": url, "markdown": "", "success": False})
+
+        return results
+
+    async def _deep_crawl_to_markdown(
+        self, domain: str, max_pages: int = 8
+    ) -> List[Dict[str, Any]]:
+        """
+        Deep crawl a domain using BestFirstCrawlingStrategy to intelligently
+        discover and prioritize pages likely to contain team/LinkedIn info.
+
+        Replaces hardcoded URL lists with automatic discovery — the crawler
+        follows links from the homepage, scoring pages by relevance to find
+        /team, /about-us, /leadership, /people, /staff pages automatically.
+
+        Args:
+            domain: Domain to crawl (e.g. "example.com")
+            max_pages: Maximum pages to crawl per domain (default 8)
+
+        Returns:
+            List of dicts with 'url', 'markdown', 'success' keys
+        """
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+        from crawl4ai.deep_crawling import BestFirstCrawlingStrategy
+        from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter
+        from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
+
+        # Score pages likely to have team/contact/LinkedIn info higher
+        scorer = KeywordRelevanceScorer(
+            keywords=[
+                "team", "about", "leadership", "people", "staff",
+                "management", "contact", "our-team", "about-us",
+                "founders", "executives", "who-we-are",
+            ],
+            weight=0.8,
+        )
+
+        # Filter out pages unlikely to have useful lead info
+        filter_chain = FilterChain([
+            URLPatternFilter(patterns=[
+                "*team*", "*about*", "*leadership*", "*people*",
+                "*staff*", "*management*", "*contact*", "*our-*",
+                "*founder*", "*executive*", "*who-we*",
+                # Also allow the homepage and common content pages
+                f"*{domain}",
+                f"*{domain}/",
+            ]),
+        ])
+
+        strategy = BestFirstCrawlingStrategy(
+            max_depth=2,
+            max_pages=max_pages,
+            url_scorer=scorer,
+            filter_chain=filter_chain,
+            include_external=False,
+        )
+
+        browser_config = BrowserConfig(
+            headless=True,
+            extra_args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        crawler_config = CrawlerRunConfig(
+            deep_crawl_strategy=strategy,
+            wait_until="domcontentloaded",
+            page_timeout=30000,
+            word_count_threshold=10,
+        )
+
+        start_url = f"https://{domain}"
+        results = []
+        seen_paths = set()  # Deduplicate by URL path (ignores www vs non-www)
+
+        def _normalize_url(url: str) -> str:
+            """Normalize URL to a canonical path for deduplication."""
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.netloc.lower().removeprefix("www.")
+            path = parsed.path.rstrip("/") or "/"
+            return f"{host}{path}"
+
+        try:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                crawl_results = await crawler.arun(
+                    url=start_url, config=crawler_config
+                )
+                # arun returns a list when using deep crawl strategy
+                if not isinstance(crawl_results, list):
+                    crawl_results = [crawl_results]
+                for result in crawl_results:
+                    if result.success and result.markdown:
+                        normalized = _normalize_url(result.url)
+                        if normalized in seen_paths:
+                            self.logger.info(
+                                f"Deep crawl skipping duplicate: {result.url}"
+                            )
+                            continue
+                        seen_paths.add(normalized)
+                        self.logger.info(
+                            f"Deep crawl found {result.url}: "
+                            f"{len(result.markdown)} chars"
+                        )
+                        results.append({
+                            "url": result.url,
+                            "markdown": result.markdown,
+                            "success": True,
+                        })
+                    else:
+                        err = getattr(result, "error_message", "unknown error")
+                        self.logger.warning(
+                            f"Deep crawl failed for {result.url}: {err}"
+                        )
+
+            self.logger.info(
+                f"Deep crawl of {domain}: {len(results)} unique pages fetched "
+                f"(max_pages={max_pages})"
+            )
+        except Exception as exc:
+            self.logger.error(f"Deep crawl error for {domain}: {exc}")
+            # Fallback: try basic crawl of homepage + common pages
+            self.logger.info(f"Falling back to basic crawl for {domain}")
+            fallback_urls = [
+                f"https://{domain}",
+                f"https://{domain}/about",
+                f"https://{domain}/about-us",
+                f"https://{domain}/team",
+                f"https://{domain}/our-team",
+                f"https://{domain}/contact",
+            ]
+            results = await self._crawl_pages_to_markdown(fallback_urls)
+
+        return results
+
+    async def _llm_extract_structured_data(
+        self, markdown: str, prompt: str, schema: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Use LLM to extract structured data from markdown content.
+
+        Args:
+            markdown: Page content as markdown
+            prompt: Extraction instructions
+            schema: JSON schema for expected output
+
+        Returns:
+            Dict matching the provided schema, or {} on failure
+        """
+        import re
+
+        # Pre-extract emails and phone numbers from full text before truncation
+        email_pattern = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+        phone_pattern = r'(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
+        found_emails = list(set(re.findall(email_pattern, markdown)))
+        found_phones = list(set(re.findall(phone_pattern, markdown)))
+
+        # Truncate markdown to stay within context limits
+        # Configurable via env: LLM_EXTRACT_MAX_CHARS (default 120000 ≈ 30K tokens)
+        max_chars = int(os.environ.get("LLM_EXTRACT_MAX_CHARS", "120000"))
+        truncated_markdown = markdown[:max_chars]
+
+        # Build a hint section with pre-extracted contact info
+        hints = ""
+        if found_emails:
+            hints += f"\nEMAIL ADDRESSES FOUND ON SITE: {', '.join(found_emails[:20])}\n"
+        if found_phones:
+            hints += f"PHONE NUMBERS FOUND ON SITE: {', '.join(found_phones[:10])}\n"
+
+        system_message = (
+            "You are a data extraction assistant. Extract structured data from the "
+            "provided web page content according to the instructions and schema. "
+            "Return ONLY valid JSON matching the schema. Do not include markdown "
+            "code fences or explanatory text."
+        )
+
+        user_message = (
+            f"{prompt}\n\n"
+            f"OUTPUT SCHEMA (return JSON matching this exactly):\n"
+            f"{json.dumps(schema, indent=2)}\n\n"
+            f"{hints}\n"
+            f"WEB PAGE CONTENT:\n{truncated_markdown}\n\n"
+            f"Extract the data now. Return ONLY the JSON object. "
+            f"IMPORTANT: Associate the email addresses and phone numbers above "
+            f"with the correct team members when possible."
+        )
+
+        for model in [self.primary_model, self.fallback_model]:
+            try:
+                response = await self.llm_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=0.0,
+                    max_tokens=int(os.environ.get("LLM_EXTRACT_MAX_TOKENS", "16000")),
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )
+
+                content = response.choices[0].message.content.strip()
+
+                # Strip markdown code fences if present
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.startswith("```"):
+                    content = content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+
+                result = json.loads(content)
+                self.logger.info(
+                    f"LLM extraction successful with {model}: "
+                    f"{len(result)} top-level keys"
+                )
+                return result
+
+            except json.JSONDecodeError as e:
+                self.logger.warning(
+                    f"LLM ({model}) returned invalid JSON: {e}"
+                )
+                continue
+            except Exception as exc:
+                self.logger.warning(f"LLM extraction failed with {model}: {exc}")
+                continue
+
+        self.logger.error("LLM extraction failed with all models")
+        return {}
+
+    async def _extract_with_crawl4ai(
         self, domain: str, icp_config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Extract data from domain using Firecrawl v2 API with single scrape operation.
+        Extract data from domain using Crawl4AI (page fetch) + LLM (structured extraction).
 
         Args:
             domain: Domain to extract from
@@ -1302,17 +1597,11 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
         Returns:
             Extracted data dictionary
         """
-        self.logger.info(f"🔍 Starting Firecrawl v2 extraction for domain: {domain}")
-        self.logger.info(
-            f"🔑 Firecrawl API key: {self.firecrawl_key[:10]}..."
-            if self.firecrawl_key
-            else "❌ No API key"
-        )
+        self.logger.info(f"Starting Crawl4AI extraction for domain: {domain}")
 
         # Detect site type to determine extraction strategy
         site_type = self._detect_site_type(icp_config)
 
-        # Route to appropriate extraction method
         if site_type == "information_database":
             return await self._extract_database_site(domain, icp_config)
         else:
@@ -1322,7 +1611,7 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
         self, domain: str, icp_config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Extract data from single company site using existing logic.
+        Extract data from single company site using Crawl4AI + LLM.
 
         Args:
             domain: Domain to extract from
@@ -1331,152 +1620,77 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
         Returns:
             Extracted data dictionary
         """
-        self.logger.info(f"🏢 Single company extraction for domain: {domain}")
-        self.logger.info(f"📋 Using schema: {FIRECRAWL_EXTRACT_SCHEMA}")
+        self.logger.info(f"Single company extraction for domain: {domain}")
 
         async with self.async_semaphore_pool:
-            self.logger.info(f"🔒 Acquired semaphore for domain: {domain}")
             try:
-                # Build URLs to extract - combine specific URLs with domain base pages
-                urls_to_extract = self._build_extraction_urls(domain, icp_config)
+                # Step 1: Deep crawl to intelligently discover relevant pages
+                # (team, about, leadership, contact) instead of hardcoded URLs
+                crawl_results = await self._deep_crawl_to_markdown(domain, max_pages=8)
 
-                # Filter out URLs that might not exist (Firecrawl will handle 404s gracefully)
-                self.logger.info(f"🌐 Will try URLs: {urls_to_extract}")
+                # Prioritize team/contact/about pages (most likely to have
+                # LinkedIn URLs and emails)
+                priority_results = []
+                other_results = []
+                for cr in crawl_results:
+                    if cr["success"] and cr["markdown"]:
+                        url_lower = cr["url"].lower()
+                        if any(kw in url_lower for kw in (
+                            "/team", "/our-team", "/people", "/staff",
+                            "/leadership", "/about", "/contact",
+                            "/management", "/founders", "/executives",
+                        )):
+                            priority_results.append(cr)
+                        else:
+                            other_results.append(cr)
+
+                # Sort each group by URL for deterministic ordering
+                priority_results.sort(key=lambda cr: cr["url"])
+                other_results.sort(key=lambda cr: cr["url"])
+
+                all_markdown = []
+                for cr in priority_results + other_results:
+                    all_markdown.append(
+                        f"=== PAGE: {cr['url']} ===\n{cr['markdown']}"
+                    )
+
+                if not all_markdown:
+                    raise Exception(f"Could not fetch any pages for {domain}")
+
+                combined_markdown = "\n\n".join(all_markdown)
                 self.logger.info(
-                    "📡 Attempting extraction from multiple pages for comprehensive data..."
+                    f"Combined markdown for {domain}: {len(combined_markdown)} chars "
+                    f"from {len(all_markdown)} pages"
                 )
 
-                try:
+                # Step 2: LLM extraction
+                dynamic_intent_prompt = self.generate_dynamic_intent_prompt(icp_config)
+                full_prompt = FIRECRAWL_EXTRACT_PROMPT
+                if dynamic_intent_prompt:
+                    full_prompt += f"\n\n{dynamic_intent_prompt}"
+
+                extracted_data = await self._llm_extract_structured_data(
+                    combined_markdown, full_prompt, FIRECRAWL_EXTRACT_SCHEMA
+                )
+
+                if extracted_data:
                     self.logger.info(
-                        f"🤖 Calling Firecrawl v2 API with urls={urls_to_extract} and schema+prompt..."
+                        f"Extracted structured data for {domain}: "
+                        f"{len(extracted_data)} fields"
                     )
-                    # Generate dynamic intent prompt based on ICP config
-                    dynamic_intent_prompt = self.generate_dynamic_intent_prompt(
-                        icp_config
-                    )
-
-                    # Combine base prompt with dynamic intent prompt
-                    full_prompt = FIRECRAWL_EXTRACT_PROMPT
-                    if dynamic_intent_prompt:
-                        full_prompt += f"\n\n{dynamic_intent_prompt}"
-
-                    # COST OPTIMIZED: Single scrape operation with json format for structured data
-                    # This replaces the previous hybrid scrape+extract approach
-                    scrape_params = {
-                        "url": urls_to_extract[
-                            0
-                        ],  # Use primary URL for cost optimization
-                        "formats": [
-                            {
-                                "type": "json",
-                                "schema": FIRECRAWL_EXTRACT_SCHEMA,
-                                "prompt": full_prompt,
-                            }
-                        ],
-                        # Performance & cost optimization (HIGH PRIORITY)
-                        "wait_for": 5000,  # 5-second wait for JavaScript content
-                        "only_main_content": False,
-                        "max_age": 172800,  # 2 days cache - reduces API calls by ~50%
-                        "block_ads": True,  # Faster loading, cleaner content
-                        "remove_base64_images": True,  # Smaller response size
-                    }
-
-                    self.logger.info(
-                        "🚀 Executing single Firecrawl scrape operation with json format..."
-                    )
-
-                    # Log cost optimization benefits
-                    self.logger.info(
-                        f"💰 Cost optimization: maxAge={scrape_params['max_age']}s (2 days), "
-                        f"blockAds={scrape_params['block_ads']}, "
-                        f"removeBase64Images={scrape_params['remove_base64_images']}"
-                    )
-                    self.logger.info(
-                        "📊 Expected cost reduction: ~50% through caching, ~20% through content filtering"
-                    )
-
-                    # Execute single scrape operation
-                    response = self.firecrawl_client.scrape(**scrape_params)
-    
-                    # Handle different response structures from Firecrawl v2
-                    if response:
-                        self.logger.info(
-                            f"✅ Firecrawl v2 scrape successful for {domain}"
-                        )
-
-                        # When using formats=["json"], the response is a Document object
-                        # with the JSON data in the json attribute
-                        if hasattr(response, "json") and response.json:
-                            json_data = response.json
-                            if json_data:
-                                self.logger.info(
-                                    f"📊 Extracted structured data: {len(json_data)} fields"
-                                )
-                                return json_data
-                            else:
-                                self.logger.warning(
-                                    f"No json data found in response.json for {domain}"
-                                )
-                                return {}
-
-                        # Check if response has data attribute (alternative structure)
-                        elif hasattr(response, "data") and response.data:
-                            json_data = response.data.get("json", {})
-                            if json_data:
-                                self.logger.info(
-                                    f"📊 Extracted structured data: {len(json_data)} fields"
-                                )
-                                return json_data
-                            else:
-                                self.logger.warning(
-                                    f"No json data found in response.data for {domain}"
-                                )
-                                return {}
-
-                        # Check if response is the data directly (fallback)
-                        else:
-                            self.logger.info(f"📊 Response structure: {type(response)}")
-                            if hasattr(response, "__dict__"):
-                                self.logger.info(
-                                    f"📊 Response attributes: {list(response.__dict__.keys())}"
-                                )
-
-                            # Try to extract data from response object
-                            if hasattr(response, "success") and response.success:
-                                # This might be an ExtractResponse object
-                                if hasattr(response, "data") and response.data:
-                                    return response.data
-                                else:
-                                    return {}
-                            else:
-                                # Response exists but no clear data structure
-                                self.logger.warning(
-                                    f"Unclear response structure for {domain}: {response}"
-                                )
-                                return {}
-                    else:
-                        self.logger.warning(
-                            f"Firecrawl v2 scrape failed for {domain}: {response}"
-                        )
-                        raise Exception(
-                            "Firecrawl v2 scrape returned unsuccessful response"
-                        )
-
-                except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout extracting from {domain}")
-                    raise Exception("Firecrawl v2 scrape timed out")
-                except Exception as exc:
-                    self.logger.warning(f"Failed to extract from {domain}: {exc}")
-                    raise
+                    # Attach raw markdown so downstream can verify
+                    # LinkedIn URLs against actual page content
+                    extracted_data["_raw_markdown"] = combined_markdown
+                return extracted_data
 
             except Exception as exc:
-                raise Exception(f"Firecrawl v2 scrape failed: {exc}")
+                raise Exception(f"Crawl4AI extraction failed for {domain}: {exc}")
 
     async def _extract_database_site(
         self, domain: str, icp_config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Extract data from information database site where each URL contains different company data.
+        Extract data from information database site using Crawl4AI + LLM.
 
         Args:
             domain: Domain to extract from
@@ -1485,24 +1699,17 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
         Returns:
             Merged extracted data from all listings
         """
-        self.logger.info(f"🏢 Information Database extraction for domain: {domain}")
+        self.logger.info(f"Database extraction for domain: {domain}")
 
-        # Get specific URLs for individual extraction
         specific_urls = icp_config.get("specific_urls", [])
         if not specific_urls:
-            self.logger.warning("⚠️ Database mode requires specific URLs")
-            # Fallback to single company mode
+            self.logger.warning("Database mode requires specific URLs, falling back")
             return await self._extract_single_company(domain, icp_config)
 
-        self.logger.info(f"🔍 Extracting from {len(specific_urls)} database listings")
-
-        # Extract from each URL individually for database sites
         urls_to_extract = self._build_extraction_urls(domain, icp_config)
-        all_extractions = []
+        self.logger.info(f"Extracting from {len(urls_to_extract)} individual URLs")
 
-        self.logger.info(f"🌐 Extracting from {len(urls_to_extract)} individual URLs")
-
-        # Generate shared schema and prompts
+        # Generate shared prompts
         dynamic_intent_prompt = self._generate_database_intent_prompt(icp_config)
         full_prompt = self._get_database_extraction_prompt(icp_config)
         if dynamic_intent_prompt:
@@ -1510,89 +1717,39 @@ IMPORTANT: If no clear intent signals are found, set business_intent_score to {i
         database_schema = self._get_database_extraction_schema(icp_config)
 
         async with self.async_semaphore_pool:
-            self.logger.info(f"🔒 Acquired semaphore for domain: {domain}")
+            # Phase 1: Crawl all URLs in one browser session
+            crawl_results = await self._crawl_pages_to_markdown(urls_to_extract)
 
-            # Extract from each URL individually
-            for i, url in enumerate(urls_to_extract):
-                try:
-                    self.logger.info(
-                        f"🔍 Extracting from URL {i + 1}/{len(urls_to_extract)}: {url}"
-                    )
-
-                    # Individual URL extraction using correct Firecrawl v2 format
-                    scrape_params = {
-                        "url": url,
-                        "formats": [
-                            {
-                                "type": "json",
-                                "schema": database_schema,
-                                "prompt": full_prompt,
-                            }
-                        ],
-                        # Performance & cost optimization
-                        "wait_for": 5000,  # 5-second wait for JavaScript content
-                        "only_main_content": False,
-                        "max_age": 172800,  # 2 days cache - reduces API calls by ~50%
-                        "block_ads": True,  # Faster loading, cleaner content
-                        "remove_base64_images": True,  # Smaller response size
-                    }
-
-                    self.logger.info(f"🚀 Executing Firecrawl scrape for URL {i + 1}")
-
-                    # Use asyncio.wait_for to set timeout
-                    timeout_seconds = 300  # 5 minutes timeout
-                    response = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda params=scrape_params: self.firecrawl_client.scrape(
-                                **params
-                            ),
-                        ),
-                        timeout=timeout_seconds,
-                    )
-
-                    # Handle Firecrawl v2 Document object response
-                    if response and hasattr(response, "json") and response.json:
-                        extracted_data = response.json
-                        self.logger.info(
-                            f"✅ Successfully extracted from URL {i + 1}: {len(extracted_data)} fields"
+            # Phase 2: LLM extraction for each successfully fetched page
+            all_extractions = []
+            for cr in crawl_results:
+                if cr["success"] and cr["markdown"]:
+                    try:
+                        extracted_data = await self._llm_extract_structured_data(
+                            cr["markdown"], full_prompt, database_schema
                         )
                         all_extractions.append(
-                            {"url": url, "data": extracted_data, "success": True}
+                            {"url": cr["url"], "data": extracted_data, "success": True}
                         )
-                    else:
-                        # Log the actual response type for debugging
-                        response_type = type(response).__name__ if response else "None"
+                    except Exception as exc:
                         self.logger.warning(
-                            f"❌ Failed to extract from URL {i + 1}: response_type={response_type}, has_json={hasattr(response, 'json') if response else False}"
+                            f"LLM extraction failed for {cr['url']}: {exc}"
                         )
                         all_extractions.append(
-                            {
-                                "url": url,
-                                "data": {},
-                                "success": False,
-                                "error": f"Invalid response type: {response_type}",
-                            }
+                            {"url": cr["url"], "data": {}, "success": False, "error": str(exc)}
                         )
-
-                except asyncio.TimeoutError:
-                    self.logger.warning(
-                        f"⏰ Timeout extracting from URL {i + 1}: {url}"
-                    )
+                else:
                     all_extractions.append(
-                        {"url": url, "data": {}, "success": False, "error": "timeout"}
-                    )
-                except Exception as exc:
-                    self.logger.warning(f"❌ Error extracting from URL {i + 1}: {exc}")
-                    all_extractions.append(
-                        {"url": url, "data": {}, "success": False, "error": str(exc)}
+                        {"url": cr["url"], "data": {}, "success": False, "error": "fetch failed"}
                     )
 
-            # Merge all successful extractions
+            # Merge all successful extractions (existing method, unchanged)
             merged_data = self._merge_database_extractions(all_extractions, icp_config)
 
             self.logger.info(
-                f"🔄 Merged data from {len([e for e in all_extractions if e['success']])} successful extractions"
+                f"Merged data from "
+                f"{len([e for e in all_extractions if e['success']])} "
+                f"successful extractions"
             )
 
             return merged_data
@@ -2066,6 +2223,7 @@ Remember: Extract unique, valuable information about each individual business op
         """
 
         # Check if this is database extraction with listings
+        self.logger.info(f"🔍 PROCESS_EXTRACTED: {record.get('domain')} site_type={extracted_data.get('site_type')} keys={list(extracted_data.keys())[:8]}")
         if (
             extracted_data.get("site_type") == "information_database"
             and "listings" in extracted_data
@@ -2086,6 +2244,10 @@ Remember: Extract unique, valuable information about each individual business op
         company["industry"] = company_data.get("industry")
         company["sub_industry"] = company_data.get("sub_industry")
         company["hq_location"] = company_data.get("hq_location")
+        company["hq_city"] = company_data.get("hq_city")
+        company["hq_country"] = company_data.get("hq_country")
+        company["hq_state"] = company_data.get("hq_state")
+        company["linkedin_url"] = company_data.get("linkedin_url")
         
         # CRITICAL: Infer sub_industry if missing (required field)
         if not company["sub_industry"] and company["industry"]:
@@ -2281,6 +2443,9 @@ Remember: Extract unique, valuable information about each individual business op
         team_members = extracted_data.get("team_members", [])
         employees = extracted_data.get("employees", [])  # Legacy support
         all_members = team_members + employees  # Combine both sources
+        self.logger.info(f"🔍 CONTACT DEBUG: {record.get('domain')} has {len(team_members)} team_members, {len(employees)} employees, {len(all_members)} total")
+        # Raw markdown from crawled pages — used to verify LinkedIn URLs
+        raw_markdown = (extracted_data.get("_raw_markdown") or "").lower()
         contacts = []
 
         for member in all_members:
@@ -2288,7 +2453,7 @@ Remember: Extract unique, valuable information about each individual business op
             full_name = member.get("name") or member.get("full_name")
             role = member.get("role")
             department = member.get("department")
-            linkedin = member.get("linkedin")
+            linkedin = member.get("linkedin") or member.get("linkedin_url")
             email = member.get("email")
             phone = member.get("phone")
             decision_maker = member.get("decision_maker", False)
@@ -2346,14 +2511,39 @@ Remember: Extract unique, valuable information about each individual business op
             if phone and phone.strip():
                 contact["phone"] = phone
 
-            # Handle LinkedIn
+            # Handle LinkedIn — verify URL exists in crawled page content
+            # and belongs to this person (not mis-assigned by LLM)
             if linkedin:
                 link_type, slug = canonicalize_linkedin(linkedin)
                 if link_type == "in":
-                    contact["linkedin"] = f"/in/{slug}"
+                    slug_lower = slug.lower()
+                    # Check 1: slug must appear in crawled pages
+                    if raw_markdown and slug_lower not in raw_markdown:
+                        self.logger.info(
+                            f"Dropping fabricated LinkedIn /in/{slug} "
+                            f"for '{full_name}' (not found in crawled pages)"
+                        )
+                    else:
+                        # Check 2: slug should relate to this person's name
+                        # Catches LLM mixing up which LinkedIn belongs to whom
+                        name_parts = re.sub(r'[^a-z\s]', '', (full_name or "").lower()).split()
+                        slug_clean = re.sub(r'[^a-z0-9]', '', slug_lower)
+                        name_in_slug = any(
+                            part in slug_clean
+                            for part in name_parts
+                            if len(part) >= 3
+                        )
+                        if name_in_slug:
+                            contact["linkedin"] = f"/in/{slug}"
+                        else:
+                            self.logger.info(
+                                f"Dropping mis-assigned LinkedIn /in/{slug} "
+                                f"for '{full_name}' (name not in slug)"
+                            )
                 elif link_type == "company":
-                    # This is a company page, not a person - skip
-                    continue
+                    # Company page URL, not personal — don't set as personal LinkedIn
+                    # but still keep the contact (email/SMTP can fill in later)
+                    pass
 
             # Set seniority and role priority
             contact["seniority"] = get_seniority_rank(role)
@@ -2369,6 +2559,7 @@ Remember: Extract unique, valuable information about each individual business op
 
         # Update record with contacts
         record["contacts"] = contacts
+        self.logger.info(f"🔍 CONTACT DEBUG: {record.get('domain')} final contacts={len(contacts)}, emails={sum(1 for c in contacts if c.get('email'))}")
 
         # Perform ICP validation
         self._validate_icp_fit(record, icp_config)

@@ -162,23 +162,22 @@ class LeadSorcererOrchestrator:
             raise
 
     def _resolve_data_dir(self) -> str:
-        """Resolve data directory with precedence."""
+        """Resolve data directory with precedence (always absolute)."""
         # Check environment variable first
         env_data_dir = os.environ.get("LEADPOET_DATA_DIR")
         if env_data_dir:
-            return env_data_dir
+            return os.path.abspath(env_data_dir)
 
-        # Default to ./data
-        return "./data"
+        # Default to ./data (resolve to absolute so temp-dir changes don't break it)
+        return os.path.abspath("./data")
 
     def _validate_provider_config(self) -> None:
         """Validate that all required providers are configured."""
         try:
             costs_config = load_costs_config()
             required_providers = [
-                "gse",
+                "serper",
                 "openrouter",
-                "firecrawl",
             ]
             validate_provider_config(required_providers, costs_config)
         except Exception as e:
@@ -456,6 +455,19 @@ class LeadSorcererOrchestrator:
             ]
             self.logger.info(f"Filtered to {len(passing_leads)} passing leads")
 
+        # Enforce max_crawl_per_run cap: sort by score (best first) and limit
+        max_crawl = self.icp_config.get("caps", {}).get("max_crawl_per_run")
+        if max_crawl and len(passing_leads) > max_crawl:
+            passing_leads.sort(
+                key=lambda r: r.get("icp", {}).get("pre_score", 0),
+                reverse=True,
+            )
+            self.logger.info(
+                f"Capping crawl to {max_crawl} leads (was {len(passing_leads)}), "
+                f"top score={passing_leads[0].get('icp', {}).get('pre_score', 0):.2f}"
+            )
+            passing_leads = passing_leads[:max_crawl]
+
         # Persist domain results (pass + rejects) - works for both modes
         self._persist_domain_results(lead_records)
 
@@ -510,6 +522,7 @@ class LeadSorcererOrchestrator:
             "total_errors": len(self.total_errors),
             "unknown_error_count": self.total_unknown_errors,
             "errors": self.total_errors,
+            "lead_records": lead_records,
         }
 
     def _persist_domain_results(self, lead_records: List[Dict[str,

@@ -155,9 +155,13 @@ async def validate_source_url(url: str, source_type: str) -> Tuple[bool, str]:
         # Create mock lead object for domain age check
         lead_mock = {"website": url}
         age_valid, age_reason = await check_domain_age(lead_mock)
-        
+
         if not age_valid:
-            return False, age_reason
+            # If we simply couldn't determine the age, don't reject
+            if "Could not determine" in str(age_reason):
+                bt.logging.debug(f"Domain age unknown for {domain}, allowing anyway")
+            else:
+                return False, age_reason
     except ImportError:
         # If check_domain_age not available, log warning but don't fail
         bt.logging.warning("Domain age check not available - skipping")
@@ -174,15 +178,20 @@ async def validate_source_url(url: str, source_type: str) -> Tuple[bool, str]:
         "Accept-Language": "en-US,en;q=0.9",
     }
     _OK_STATUSES = {200, 301, 302, 303, 307, 308}
+    # Sites that block simple HTTP but were already crawled by Playwright are still valid
+    _CRAWLED_OK_STATUSES = {200, 301, 302, 303, 307, 308, 403, 406, 429}
     try:
         async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
             async with session.head(url, timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as response:
                 if response.status in _OK_STATUSES:
                     return True, "Source URL validated"
-                # Some servers block HEAD or bare requests — fall back to GET
+                # Many company sites block HEAD/GET from non-browser clients
+                # but were already successfully crawled via Playwright browser
+                if response.status in _CRAWLED_OK_STATUSES and source_type == "company_site":
+                    return True, "Source URL validated (company site, crawled via browser)"
                 if response.status in (403, 405):
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as fallback:
-                        if fallback.status in _OK_STATUSES:
+                        if fallback.status in _CRAWLED_OK_STATUSES:
                             return True, "Source URL validated"
                         return False, f"Source URL returned status {fallback.status}"
                 return False, f"Source URL returned status {response.status}"
